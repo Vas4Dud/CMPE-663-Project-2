@@ -34,6 +34,7 @@
  *  HAL does not change it.
  ******************************************************************************
  */
+#include <stdint.h>
 #include <stdio.h>
 #include "main.h"
 #include "app.h"
@@ -56,6 +57,8 @@ extern TSC_HandleTypeDef htsc;
 #define TOUCH_PERIOD_MS   100u
 #define STATUS_PERIOD_MS  500u
 
+#define PATIENT_PRESENT       2400
+#define PATIENT_ABSENT        2500
 /* EXTI press counters. The ISR writes them, and the loop reads them (R23). */
 static volatile uint32_t b1_presses, b2_presses, imu_int1_events;
 
@@ -164,7 +167,11 @@ void app_service(void)
 {
     static uint32_t touch_last, status_last;
     static int32_t  touch_raw = -1;
+    static uint8_t bed_used = 0;
+    static uint8_t touch_detected = 0;
     uint32_t now = HAL_GetTick();
+    static uint8_t time_status = 0;
+    static uint8_t previous_state = 0;
 
     /* Touch sampling — non-blocking, ~10 Hz (R1 groundwork). */
     if ((uint32_t)(now - touch_last) >= TOUCH_PERIOD_MS) {
@@ -172,9 +179,53 @@ void app_service(void)
         if (v >= 0) {
             touch_raw = v;
             touch_last = now;
+            if (v <= PATIENT_PRESENT)
+            {
+                touch_detected = 1;
+            }
+            else if (v >= PATIENT_ABSENT)
+            {
+                touch_detected = 0;
+            }
         }
     }
+    
+    static uint32_t timer_start;
+    static uint8_t first_state = 0;
+    if (touch_detected != bed_used)
+    {
+        if (!first_state)
+        {
+            timer_start = now;
+            first_state = 1;
+        }
+        else {
+            uint32_t time_diff = (uint32_t) now - timer_start;
+            if (bed_used)
+            {
+                if (time_diff > 3000)
+                {
+                    bed_used = 0;
+                    first_state = 0;
+                    printf("PATIENT ABSENT\n");
+                }
+            }
+            else {
+                if (time_diff > 1000)
+                {
+                    bed_used = 1;
+                    first_state = 0;
+                    printf("PATIENT PRESENT\n");
+                }
+            }
 
+        }
+    }
+    else {
+        first_state = 0;
+    }
+
+    
     /* Status line — on change cadence, cheap (R18 discipline). */
     if ((uint32_t)(now - status_last) >= STATUS_PERIOD_MS) {
         status_last = now;
@@ -194,3 +245,40 @@ void app_service(void)
         }
     }
 }
+
+/*
+void app_service(void)
+{
+    static uint32_t touch_last, status_last;
+    static int32_t  touch_raw = -1;
+    uint32_t now = HAL_GetTick();
+
+    // Touch sampling — non-blocking, ~10 Hz (R1 groundwork). 
+    if ((uint32_t)(now - touch_last) >= TOUCH_PERIOD_MS) {
+        int32_t v = touch_read_raw();
+        if (v >= 0) {
+            touch_raw = v;
+            touch_last = now;
+        }
+    }
+
+    // Status line — on change cadence, cheap (R18 discipline). 
+    if ((uint32_t)(now - status_last) >= STATUS_PERIOD_MS) {
+        status_last = now;
+        oled_printf(4, "touch %5ld", (long)touch_raw);
+        oled_printf(5, "B1 x%lu  B2 x%lu",
+                    (unsigned long)b1_presses, (unsigned long)b2_presses);
+    }
+
+    // Console echo — the one non-blocking console call (R20). 
+    {
+        int ch = console_poll();
+        if (ch >= 0x20 && ch <= 0x7E) {
+            putchar(ch);
+            fflush(stdout);
+        } else if (ch == '\r') {
+            printf("\n");
+        }
+    }
+}*/
+

@@ -68,15 +68,126 @@ ISM330DHCX_Object_t imu;
  */
 
 /* ====================== STUDENT CODE END — IO glue ====================== */
+static int32_t bus_init(void)   { return 0; }
+
+static int32_t bus_deinit(void)   { return 0; }
+
+static int32_t bus_read(uint16_t addr, uint16_t reg,
+                            uint8_t *p, uint16_t len) 
+ {
+    if (HAL_I2C_Mem_Read (&hi2c3, addr, reg,
+                     I2C_MEMADD_SIZE_8BIT, p, len, BUS_TMO_MS) == HAL_OK)
+                     return 0;
+    else
+    {
+        return -1;
+    }
+ }
+
+ static int32_t bus_write(uint16_t addr, uint16_t reg,
+                            uint8_t *p, uint16_t len) 
+ {
+    if (HAL_I2C_Mem_Write(&hi2c3, addr, reg,
+                     I2C_MEMADD_SIZE_8BIT, p, len, BUS_TMO_MS) == HAL_OK)
+    {
+        return 0;
+    }
+    else
+    {
+        return -1;
+    }
+ }
+
+static int32_t bus_tick(void)   { return (int32_t)HAL_GetTick(); }
+
+static void bus_delay(uint32_t ms)   { HAL_Delay(ms); }
 
 int32_t vitals_bus_init(void)
 {
     /* =================== STUDENT CODE BEGIN — binding =================== */
+    //INITIALIZE TEMP SENSOR
+    STTS22H_IO_t temp_io;
+    temp_io.Init = bus_init;
+    temp_io.DeInit = bus_deinit;
+    temp_io.BusType = 0;
+    temp_io.Address = STTS22H_I2C_ADD_H;
+    temp_io.WriteReg = bus_write;
+    temp_io.ReadReg = bus_read;
+    temp_io.GetTick = bus_tick;
 
-    /* TODO: steps 2a–2e from the header comment, for the two sensors.
-     * Erase the two lines below when you start. */
-    printf("vitals_bus_init: NOT IMPLEMENTED (see App/vitals_bus.c)\n");
-    return -1;
+    int32_t temp_pass = 0;
+    int32_t fail_found_temp = 0;
+    
+    temp_pass = STTS22H_RegisterBusIO(&temp_sensor, &temp_io);
+    if (temp_pass != 0){fail_found_temp = 1;}
+
+    uint8_t id_temp = 0;
+    temp_pass = STTS22H_ReadID(&temp_sensor, &id_temp);
+    if (temp_pass != 0){fail_found_temp = 1;}
+    //add print statement here
+    if (id_temp != STTS22H_ID)
+    {
+        fail_found_temp = 1;
+    }
+
+
+    //INITIALIZE ACC
+    ISM330DHCX_IO_t acc_io;
+    acc_io.Init = bus_init;
+    acc_io.DeInit = bus_deinit;
+    acc_io.BusType = 0;
+    acc_io.Address = ISM330DHCX_I2C_ADD_H;
+    acc_io.WriteReg = bus_write;
+    acc_io.ReadReg = bus_read;
+    acc_io.GetTick = bus_tick;
+    acc_io.Delay = bus_delay;
+    
+    int32_t acc_pass = 0;
+    int32_t fail_found_acc = 0;
+
+    acc_pass = ISM330DHCX_RegisterBusIO(&imu, &acc_io);
+    if (acc_pass != 0){fail_found_acc = 1;}
+
+    //add print statement here
+    uint8_t id_acc = 0;
+    acc_pass = ISM330DHCX_ReadID(&imu, &id_acc);
+    if (acc_pass != 0){fail_found_acc = 1;}
+    if (id_acc != ISM330DHCX_ID)
+    {
+        fail_found_acc = 1;
+    }
+
+    //print found or missing
+    if (fail_found_temp == 0)
+    {
+        printf("STTS22H 0x%X Found!\n", id_temp);
+    }
+    else {
+        printf("STTS22H 0x%X missing!\n", id_temp);
+    }
+
+    if (fail_found_acc == 0)
+    {
+        printf("ISM330DHCX 0x%X Found!\n", id_acc);
+    }
+    else {
+        printf("ISM330DHCX 0x%X missing!\n", id_acc);
+    }
+    
+    if (fail_found_acc == 0 && fail_found_temp == 0)
+    {
+        //Enable the sensors
+        STTS22H_Init(&temp_sensor); 
+        STTS22H_TEMP_Enable(&temp_sensor);
+        STTS22H_TEMP_SetOutputDataRate(&temp_sensor, 1.0f);
+
+        ISM330DHCX_Init(&imu); 
+        ISM330DHCX_ACC_Enable(&imu);
+        return 0;
+    }
+    else {
+        return -1;
+    }
 
     /* ==================== STUDENT CODE END — binding ==================== */
 }
