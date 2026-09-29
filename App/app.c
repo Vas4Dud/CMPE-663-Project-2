@@ -36,6 +36,7 @@
  */
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <math.h>
 #include "main.h"
 #include "app.h"
@@ -59,11 +60,14 @@ extern TSC_HandleTypeDef htsc;
 #define TOUCH_PERIOD_MS   100u
 #define STATUS_PERIOD_MS  500u
 #define TEMP_PERIOD_MS    1000u
+#define CLOCK_RESET       10000u
+#define MONITOR_CLOCK     120000u
 
 #define PATIENT_PRESENT       2400
 #define PATIENT_ABSENT        2500
 /* EXTI press counters. The ISR writes them, and the loop reads them (R23). */
 static volatile uint32_t b1_presses, b2_presses, imu_int1_event;
+static uint32_t angle_offset = 0;
 
 void HAL_GPIO_EXTI_Callback(uint16_t pin)
 {
@@ -174,7 +178,8 @@ void app_service(void)
     static uint8_t time_status = 0;
     static uint8_t previous_state = 0;
     static enum {     STANDBY, MONITOR, ALERT, CONFIG } Mode = STANDBY;
-
+    static enum { SUPINE, LEFT_30, RIGHT_30 } Posture;
+    static struct {uint8_t turn_due; uint8_t hob_high; uint8_t temp_arise} Alerts = {0};
     /* Touch sampling — non-blocking, ~10 Hz (R1 groundwork). */
     if ((uint32_t)(now - touch_last) >= TOUCH_PERIOD_MS) {
         int32_t v = touch_read_raw();
@@ -194,6 +199,7 @@ void app_service(void)
     
     static uint32_t timer_start;
     static uint8_t first_state = 0;
+    static uint8_t stand_to_mon = 0;
     if (touch_detected != bed_used)
     {
         if (!first_state)
@@ -209,6 +215,7 @@ void app_service(void)
                 {
                     bed_used = 0;
                     Mode = STANDBY;
+                    
                     first_state = 0;
                     printf("PATIENT ABSENT\n");
                 }
@@ -218,8 +225,9 @@ void app_service(void)
                 {
                     bed_used = 1;
                     Mode = MONITOR;
+                    stand_to_mon = 1;
                     first_state = 0;
-                    printf("PATIENT PRESENT\n");
+                    printf("[%d.%d] PATIENT PRESENT\n", now / 1000, now % 1000);
                 }
             }
 
@@ -230,43 +238,134 @@ void app_service(void)
     }
     
     static uint32_t prev_temp = 0;
-    static uint32_t prev_angle = 0;
+    static int32_t prev_angle = 0;
+    static uint32_t prev_angle_time = 0;
     static uint8_t temp_changed = 0;
     static uint8_t angle_changed = 0;
+    static uint32_t start_clock = 0;
+    static uint8_t clock_flag = 0;
+
+    uint32_t temp = read_temp();
+    if (temp != prev_temp)
+    {
+        temp_changed = 1;
+    }
+    else
+    {
+        temp_changed = 0;
+    }
+    prev_temp = temp;
+    
+
+    int32_t angle = read_angle();
+    uint8_t posture_flag = 0;
+    if (angle <= 100 && angle >= -100)
+    {
+        if (Posture != SUPINE)
+        {
+            posture_flag = 1;
+        }
+        else
+        {
+            posture_flag = 0;
+        }
+        Posture = SUPINE;
+    }
+    else if (angle <= 400 && angle >= 200)
+    {
+        if (Posture != RIGHT_30)
+        {
+            posture_flag = 1;
+        }
+        else
+        {
+            posture_flag = 0;
+        }
+        Posture = RIGHT_30;
+    }
+    else if (angle <= -200 && angle >= -400)
+    {
+        if (Posture != LEFT_30)
+        {
+            posture_flag = 1;
+        }
+        else
+        {
+            posture_flag = 0;
+        }
+        Posture = LEFT_30;
+    }
+    else if (angle > 400 || angle < -400)
+    {
+        Alerts.hob_high = 1;
+        Mode = ALERT;
+    }
+    
+    if (angle != prev_angle)
+    {
+        angle_changed = 1;
+        prev_angle_time = now;
+    }
+    else
+    {
+        angle_changed = 0;
+    }
+    prev_angle = angle;
     switch (Mode)
     {
-        case STANDBY: {
-            uint32_t temp = read_temp();
-            if (temp != prev_temp)
-            {
-                temp_changed = 1;
-            }
-            else
-            {
-                temp_changed = 0;
-            }
-            prev_temp = temp;
-            
-
-            int32_t angle = read_angle();
-            
-            if (angle != prev_angle)
-            {
-                angle_changed = 1;
-            }
-            else
-            {
-                angle_changed = 0;
-            }
-            prev_angle = angle;
-
-
-            break;
-        }
         case MONITOR: {
             //oled live view
             //device logs events
             //reposoitning clock runs
+            static int32_t baseline = 0;
+            if (clock_flag == 0)
+            {
+                start_clock = now;
+                clock_flag = 1;
+            }
+            if (stand_to_mon == 1)
+            {
+                
+                static uint8_t get_ten_temps = 0;
+                
+                if (get_ten_temps < 10)
+                {
+                    baseline += temp;
+                    get_ten_temps ++;
+                }
+                else
+                {
+                    baseline /= 10;
+                    get_ten_temps = 0;
+                    stand_to_mon = 0;
+                }
+            }
+            else
+            {
+                if (abs(temp - baseline) > 2)
+                {
+                    Alerts.temp_arise = 1;
+                    Mode = ALERT; //USE QUALIFY . C HERE????
+                }
+            }
+            if ((uint32_t)(now - start_clock) >= MONITOR_CLOCK)
+            {
+                Alerts.turn_due = 1;
+                Mode = ALERT;
+                printf("TURN PATIENT");
+            }
+            
+            if (posture_flag == 1 && 
+                        (now - prev_angle_time) >= CLOCK_RESET)
+            {
+                clock_flag = 0;
+            }
+            break;
+        }
+        case ALERT:
+        {
+            
+            break;
         }
     }
     
@@ -274,6 +373,7 @@ void app_service(void)
 
     
     /* Status line — on change cadence, cheap (R18 discipline). */
+    //OONLY OLED SHOULD PRINT EVERYTHING HERE, live updates
     if ((uint32_t)(now - status_last) >= STATUS_PERIOD_MS) {
         status_last = now;
         oled_printf(4, "touch %5ld", (long)touch_raw);
@@ -297,13 +397,26 @@ void app_service(void)
     }
 
     /* Console echo — the one non-blocking console call (R20). */
+    static char buffer[16];
+    char *argv[8];
+    static uint8_t buffer_length = 0;
+    int ch = console_poll();
     {
-        int ch = console_poll();
+        
         if (ch >= 0x20 && ch <= 0x7E) {
+            buffer[buffer_length++] = (char) ch;
             putchar(ch);
             fflush(stdout);
-        } else if (ch == '\r') {
+        } 
+        else if (ch == '\r') {
+            buffer[buffer_length] = '\0';
+            buffer_length = 0;
             printf("\n");
+            int argc = console_tokenize(buffer, argv, 8);
+            if (argc == 0) {
+                continue;
+            }
+            process_user_input(argv);
         }
     }
 }
@@ -323,6 +436,7 @@ uint32_t read_temp(void)
     return -1;
 }
 
+uint32_t angle = 0;
 int32_t read_angle()
 {
     float pitch = 0;
@@ -357,9 +471,163 @@ int32_t read_angle()
         smooth_acc.z /= 4;
         float within_sqr = (float)(smooth_acc.y * smooth_acc.y) + (float)(smooth_acc.z * smooth_acc.z);
         pitch = atan2f((float)smooth_acc.x, sqrtf(within_sqr)) * (180.0 / M_PI);
-        int32_t angle = lroundf(pitch * 10);
+        angle = lroundf(pitch * 10) - angle_offset;
 
         smooth_count = 0;
         return angle;
     }
 }
+
+void process_user_input(char* command[])
+{
+    uint32_t v;
+    if (strcmp(command[0], "status") == 0) 
+    {
+        //PRINT LOG
+    } 
+    else if (strcmp(command[0], "cal") == 0) 
+    {
+        angle_offset = angle;
+    }
+    else if (strcmp(command[0], "cal") == 0) {
+        if (argc < 2 || !parse_u32(command[1], &v)) {
+            printf("rejected: usage 'cal <microseconds>' (digits only)\n");
+        } else if (validate_e(v, &settings)) {
+            settings.E = v;
+            show_settings();
+        }
+}
+
+//Need to figure out graduate requriement still!!!
+//example Plain Text, this is all Putyty needs to send
+/*
+[ 0.000] POST START
+[ 0.035] STTS22H FOUND ID=0xA0
+[ 0.040] ISM330DHCX FOUND ID=0x6B
+[ 0.050] POST PASS
+ 
+[ 15.322] PATIENT PRESENT
+[ 15.322] MODE MONITOR
+ 
+[ 25.521] TEMP BASELINE 24.3C
+ 
+[ 140.000] TURN-DUE INTERVAL EXCEEDED
+ 
+[ 150.100] ACK TURN-DUE OVERDUE 10S
+ 
+[ 210.100] TURN-DUE REARM
+ 
+[ 250.201] POSTURE CHANGE SUPINE->LEFT_30
+[ 250.202] CLOCK RESET
+ 
+[ 320.500] HOB-HIGH SET 32.1
+ 
+[ 345.800] HOB-HIGH CLEAR
+ 
+[ 380.100] TEMP-RISE SET
+ 
+[ 400.000] PATIENT ABSENT
+[ 400.000] MODE STANDBY
+[ 400.000] ALERTS CLEARED*/
+
+
+
+/*LIVE Page
+
+Default page.
+
+Shows current measurements.
+
+Example:
+
+Plain Text
+LIVE
+ 
+Present: YES
+ 
+Angle: 14.8
+Temp: 26.1
+Base: 24.0
+ 
+NORMAL
+ 
+Show more lines
+
+or
+
+Plain Text
+LIVE
+ 
+Present: YES
+ 
+Angle: 32.1
+Temp: 25.2
+Base: 24.0
+ 
+HOB-HIGH
+ 
+Show more lines
+
+Requirements say LIVE should show:
+
+Plain Text
+presence
+angle
+temperature
+baseline temperature*/
+
+/*CLOCKS Page
+
+Shows timing.
+
+Example:
+
+Plain Text
+CLOCKS
+ 
+Turn: 01:43
+Limit: 02:00
+ 
+Mode: MONITOR
+ 
+State: 01:43
+Show more lines
+
+The nurse can directly see:
+
+Plain Text
+how long since last reposition
+Show more lines
+
+After TURN-DUE:
+
+Plain Text
+CLOCKS
+ 
+OVERDUE
+ 
+02:36
+Show more lines
+SESSION Page
+
+Statistics.
+
+Example:
+
+Plain Text
+SESSION
+ 
+Events: 24
+ 
+Alerts: 3
+ 
+Posture:
+SUPINE
+Show more lines
+
+For GR-A you might also show:
+
+Plain Text
+SUP 50%
+LEFT 30%
+RIGHT 20%*/ //BUTTOn 2 cycles these pages
