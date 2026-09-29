@@ -36,10 +36,12 @@
  */
 #include <stdint.h>
 #include <stdio.h>
+#include <math.h>
 #include "main.h"
 #include "app.h"
 #include "console.h"
 #include "oled.h"
+#include "stm32wb5mxx.h"
 #include "vitals_bus.h"
 
 extern I2C_HandleTypeDef hi2c3;          /* CubeMX-generated handles      */
@@ -56,11 +58,12 @@ extern TSC_HandleTypeDef htsc;
 
 #define TOUCH_PERIOD_MS   100u
 #define STATUS_PERIOD_MS  500u
+#define TEMP_PERIOD_MS    1000u
 
 #define PATIENT_PRESENT       2400
 #define PATIENT_ABSENT        2500
 /* EXTI press counters. The ISR writes them, and the loop reads them (R23). */
-static volatile uint32_t b1_presses, b2_presses, imu_int1_events;
+static volatile uint32_t b1_presses, b2_presses, imu_int1_event;
 
 void HAL_GPIO_EXTI_Callback(uint16_t pin)
 {
@@ -68,9 +71,8 @@ void HAL_GPIO_EXTI_Callback(uint16_t pin)
      * no OLED work here. */
     if (pin == User_B1_Pin)  { b1_presses++; }
     if (pin == User_B2_Pin)  { b2_presses++; }
-    if (pin == INT1_Pin)     { imu_int1_events++; }
+    if (pin == INT1_Pin)     { imu_int1_event = 1; }
 }
-
 /*
  * Non-blocking TSC acquisition of the TS1 key (group 6, and group 4 is
  * the shield electrode). Call it in each loop cycle. It returns the new
@@ -134,7 +136,6 @@ void app_init(void)
 {
     console_init();
     oled_init();
-
     printf("\nDG-30 DecuGuard -- P2 starter smoke test\n");
     printf("SWEN 563 / CMPE 663. Type: it echoes. B1/B2: counted.\n\n");
 
@@ -172,6 +173,7 @@ void app_service(void)
     uint32_t now = HAL_GetTick();
     static uint8_t time_status = 0;
     static uint8_t previous_state = 0;
+    static enum {     STANDBY, MONITOR, ALERT, CONFIG } Mode = STANDBY;
 
     /* Touch sampling — non-blocking, ~10 Hz (R1 groundwork). */
     if ((uint32_t)(now - touch_last) >= TOUCH_PERIOD_MS) {
@@ -206,6 +208,7 @@ void app_service(void)
                 if (time_diff > 3000)
                 {
                     bed_used = 0;
+                    Mode = STANDBY;
                     first_state = 0;
                     printf("PATIENT ABSENT\n");
                 }
@@ -214,6 +217,7 @@ void app_service(void)
                 if (time_diff > 1000)
                 {
                     bed_used = 1;
+                    Mode = MONITOR;
                     first_state = 0;
                     printf("PATIENT PRESENT\n");
                 }
@@ -224,6 +228,49 @@ void app_service(void)
     else {
         first_state = 0;
     }
+    
+    static uint32_t prev_temp = 0;
+    static uint32_t prev_angle = 0;
+    static uint8_t temp_changed = 0;
+    static uint8_t angle_changed = 0;
+    switch (Mode)
+    {
+        case STANDBY: {
+            uint32_t temp = read_temp();
+            if (temp != prev_temp)
+            {
+                temp_changed = 1;
+            }
+            else
+            {
+                temp_changed = 0;
+            }
+            prev_temp = temp;
+            
+
+            int32_t angle = read_angle();
+            
+            if (angle != prev_angle)
+            {
+                angle_changed = 1;
+            }
+            else
+            {
+                angle_changed = 0;
+            }
+            prev_angle = angle;
+
+
+            break;
+        }
+        case MONITOR: {
+            //oled live view
+            //device logs events
+            //reposoitning clock runs
+        }
+    }
+    
+
 
     
     /* Status line — on change cadence, cheap (R18 discipline). */
@@ -232,6 +279,21 @@ void app_service(void)
         oled_printf(4, "touch %5ld", (long)touch_raw);
         oled_printf(5, "B1 x%lu  B2 x%lu",
                     (unsigned long)b1_presses, (unsigned long)b2_presses);
+        if (temp_changed)
+        {
+            printf("temperature: %d.%d   \n", temp / 10, temp % 10);
+        }
+        if (angle_changed)
+        {
+            if (angle < 0)
+            {
+                angle *= -1;
+                printf("current angle: -%d.%d   \n", angle / 10, angle % 10);
+            } 
+            else {
+                printf("current angle: %d.%d   \n", angle / 10, angle % 10);
+            }
+        }
     }
 
     /* Console echo — the one non-blocking console call (R20). */
@@ -246,39 +308,58 @@ void app_service(void)
     }
 }
 
-/*
-void app_service(void)
+uint32_t read_temp(void)
 {
-    static uint32_t touch_last, status_last;
-    static int32_t  touch_raw = -1;
-    uint32_t now = HAL_GetTick();
-
-    // Touch sampling — non-blocking, ~10 Hz (R1 groundwork). 
-    if ((uint32_t)(now - touch_last) >= TOUCH_PERIOD_MS) {
-        int32_t v = touch_read_raw();
-        if (v >= 0) {
-            touch_raw = v;
-            touch_last = now;
-        }
-    }
-
-    // Status line — on change cadence, cheap (R18 discipline). 
-    if ((uint32_t)(now - status_last) >= STATUS_PERIOD_MS) {
-        status_last = now;
-        oled_printf(4, "touch %5ld", (long)touch_raw);
-        oled_printf(5, "B1 x%lu  B2 x%lu",
-                    (unsigned long)b1_presses, (unsigned long)b2_presses);
-    }
-
-    // Console echo — the one non-blocking console call (R20). 
+    uint8_t temp_status = 0;
+    float temp = 0;
+    STTS22H_TEMP_Get_DRDY_Status(&temp_sensor, &temp_status);
+    if (temp_status)
     {
-        int ch = console_poll();
-        if (ch >= 0x20 && ch <= 0x7E) {
-            putchar(ch);
-            fflush(stdout);
-        } else if (ch == '\r') {
-            printf("\n");
+        STTS22H_TEMP_GetTemperature(&temp_sensor, &temp);
+        uint32_t temperature = (uint32_t) temp * 10;
+        return temperature;
+        
+    }
+    return -1;
+}
+
+int32_t read_angle()
+{
+    float pitch = 0;
+    ISM330DHCX_Axes_t current_acc;
+    static ISM330DHCX_Axes_t four_acc[4];
+    static ISM330DHCX_Axes_t smooth_acc;
+    smooth_acc.x = 0;
+    smooth_acc.y = 0;
+    smooth_acc.z = 0;
+    
+    static uint8_t smooth_count = 0;
+    if (imu_int1_event == 1)
+    {
+        uint32_t check = ISM330DHCX_ACC_GetAxes(&imu, &current_acc);
+        if (check == 0)
+        {
+            four_acc[smooth_count] = current_acc;
+            smooth_count++;
+            imu_int1_event = 0;
         }
     }
-}*/
+    if (smooth_count == 4)
+    {
+        for (int i = 0; i < 4; i++)
+        {
+            smooth_acc.x += four_acc[i].x;
+            smooth_acc.y += four_acc[i].y;
+            smooth_acc.z += four_acc[i].z;
+        }
+        smooth_acc.x /= 4;
+        smooth_acc.y /= 4;
+        smooth_acc.z /= 4;
+        float within_sqr = (float)(smooth_acc.y * smooth_acc.y) + (float)(smooth_acc.z * smooth_acc.z);
+        pitch = atan2f((float)smooth_acc.x, sqrtf(within_sqr)) * (180.0 / M_PI);
+        int32_t angle = lroundf(pitch * 10);
 
+        smooth_count = 0;
+        return angle;
+    }
+}

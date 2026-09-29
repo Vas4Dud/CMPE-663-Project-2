@@ -183,6 +183,7 @@ int32_t vitals_bus_init(void)
 
         ISM330DHCX_Init(&imu); 
         ISM330DHCX_ACC_Enable(&imu);
+        ISM330DHCX_ACC_Enable_DRDY_On_INT1(&imu);
         return 0;
     }
     else {
