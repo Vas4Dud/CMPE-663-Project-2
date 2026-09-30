@@ -34,16 +34,39 @@
  *  HAL does not change it.
  ******************************************************************************
  */
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <math.h>
+#include "config_table.h"
 #include "main.h"
 #include "app.h"
 #include "console.h"
 #include "oled.h"
+#include "qualify.h"
 #include "stm32wb5mxx.h"
+#include "stts22h.h"
 #include "vitals_bus.h"
+#include "ui_pages.h"
+static Posture posture = UNCLEAR;
+static bool read_angle(uint32_t now);
+static bool read_temp(int32_t *new_temp);
+int console_tokenize(char *line, char *argv[], int max_tokens);
+static void render_live(void);
+static void render_clocks(void);
+static void render_session(void);
+static void set_config(void);
+static void alerts_service(uint32_t now, bool b1);
+static void alert_clear(int i);
+static void alert_found(int i, uint32_t now);
+static void set_config(void);
+static Posture posture_check(int32_t roll);
+static void supervise_turn(uint32_t now);
+static void clock_reset(uint32_t now);
+static void monitor_angle(uint32_t now);
+static void monitor_temp(uint32_t now);
 
 extern I2C_HandleTypeDef hi2c3;          /* CubeMX-generated handles      */
 extern TSC_HandleTypeDef htsc;
@@ -60,21 +83,25 @@ extern TSC_HandleTypeDef htsc;
 #define TOUCH_PERIOD_MS   100u
 #define STATUS_PERIOD_MS  500u
 #define TEMP_PERIOD_MS    1000u
-#define CLOCK_RESET       10000u
-#define MONITOR_CLOCK     120000u
 
 #define PATIENT_PRESENT       2400
 #define PATIENT_ABSENT        2500
+#define TEMP_HYSTERISIS       20  
 /* EXTI press counters. The ISR writes them, and the loop reads them (R23). */
 static volatile uint32_t b1_presses, b2_presses, imu_int1_event;
-static uint32_t angle_offset = 0;
-
+static int32_t angle_offset = 0;
+static int32_t roll_offset = 0;
+static int32_t roll_calib = 0;
+static qualify_t hob;
+static qualify_t temp_qualify;
+static int32_t  ref_angle;
+const char *const pos_names[] = { "SUPINE", "LEFT_30", "RIGHT_30", "UNCLEAR" };
 void HAL_GPIO_EXTI_Callback(uint16_t pin)
 {
     /* ISR rule (R23): latch the event and return. No I2C, no printf, and
      * no OLED work here. */
-    if (pin == User_B1_Pin)  { b1_presses++; }
-    if (pin == User_B2_Pin)  { b2_presses++; }
+    if (pin == User_B1_Pin)  { b1_presses = 1; }
+    if (pin == User_B2_Pin)  { b2_presses = 1; }
     if (pin == INT1_Pin)     { imu_int1_event = 1; }
 }
 /*
@@ -136,16 +163,47 @@ static int32_t touch_read_raw(void)
     }
 }
 
+static int32_t prev_temp = 0;
+static int32_t temp = 0;
+static int32_t angle = 0;
+static int32_t prev_angle = 0;
+static uint32_t prev_angle_time = 0;
+static uint8_t temp_changed = 0;
+static uint8_t angle_changed = 0;
+static uint32_t start_clock = 0;
+static uint8_t clock_flag = 0;
+static uint8_t bed_used = 0;
+static uint32_t event_count = 0;
+static uint32_t alert_count = 0;
+static uint8_t monitor_flag = 0;
+static uint8_t baseline_ready = 0;
+static int32_t baseline = 0;
+
+
+typedef struct {
+    const char *name;
+    bool active;
+    bool ack;
+    uint32_t time_found;
+    uint32_t t_ack;
+} Alerts;
+
+static Alerts alert_list[3] = {{"TURN-DUE"}, {"TEMP-RISE"}, {"HOB-HIGH"}};
+
 void app_init(void)
 {
     console_init();
     oled_init();
-    printf("\nDG-30 DecuGuard -- P2 starter smoke test\n");
-    printf("SWEN 563 / CMPE 663. Type: it echoes. B1/B2: counted.\n\n");
 
-    oled_write_line(0, "DG-30  P2 STARTER");
-    oled_write_line(2, "smoke test running");
-    oled_write_line(7, "touch TS1 pad...");
+    ui_pages_init();
+    ui_pages_register(UI_PAGE_LIVE,    "LIVE",    render_live);
+    ui_pages_register(UI_PAGE_CLOCKS,  "CLOCKS",  render_clocks);
+    ui_pages_register(UI_PAGE_SESSION, "SESSION", render_session);
+
+    printf("\nDG-30 DecuGuard\n");
+
+    oled_write_line(0, "DG-30");
+    oled_write_line(2, "test running");
 
     /* Raw bus proof: do the two sensors answer at all? (Your POST
      * identifies each one by WHO_AM_I through the component drivers.)   */
@@ -168,18 +226,22 @@ void app_init(void)
     }
 }
 
+float pitch = 0;
+float roll = 0;
+
 void app_service(void)
 {
     static uint32_t touch_last, status_last;
     static int32_t  touch_raw = -1;
-    static uint8_t bed_used = 0;
+    
     static uint8_t touch_detected = 0;
     uint32_t now = HAL_GetTick();
     static uint8_t time_status = 0;
     static uint8_t previous_state = 0;
-    static enum {     STANDBY, MONITOR, ALERT, CONFIG } Mode = STANDBY;
-    static enum { SUPINE, LEFT_30, RIGHT_30 } Posture;
-    static struct {uint8_t turn_due; uint8_t hob_high; uint8_t temp_arise} Alerts = {0};
+    
+
+
+
     /* Touch sampling — non-blocking, ~10 Hz (R1 groundwork). */
     if ((uint32_t)(now - touch_last) >= TOUCH_PERIOD_MS) {
         int32_t v = touch_read_raw();
@@ -207,27 +269,34 @@ void app_service(void)
             timer_start = now;
             first_state = 1;
         }
-        else {
+        else 
+        {
             uint32_t time_diff = (uint32_t) now - timer_start;
             if (bed_used)
             {
-                if (time_diff > 3000)
+                if (time_diff > cfg_absent_ms)
                 {
                     bed_used = 0;
-                    Mode = STANDBY;
+                    monitor_flag = 0;
                     
                     first_state = 0;
-                    printf("PATIENT ABSENT\n");
+                    printf("[%4lu.%03lu] PATIENT ABSENT\n", now / 1000, now % 1000);
+                    event_count++;
                 }
             }
-            else {
-                if (time_diff > 1000)
+            else 
+            {
+                if (time_diff > cfg_present_ms)
                 {
                     bed_used = 1;
-                    Mode = MONITOR;
+                    monitor_flag = 1;
+                    baseline_ready = 0;
+                    qualify_init(&hob, 
+                        cfg_hob_limit_tenths, (uint32_t) cfg_t_grace_s * 1000, 20, now);
                     stand_to_mon = 1;
                     first_state = 0;
-                    printf("[%d.%d] PATIENT PRESENT\n", now / 1000, now % 1000);
+                    printf("[%4lu.%03lu] PATIENT PRESENT\n", now / 1000, now % 1000);
+                    event_count++;
                 }
             }
 
@@ -237,209 +306,227 @@ void app_service(void)
         first_state = 0;
     }
     
-    static uint32_t prev_temp = 0;
-    static int32_t prev_angle = 0;
-    static uint32_t prev_angle_time = 0;
-    static uint8_t temp_changed = 0;
-    static uint8_t angle_changed = 0;
-    static uint32_t start_clock = 0;
-    static uint8_t clock_flag = 0;
-
-    uint32_t temp = read_temp();
-    if (temp != prev_temp)
+    static uint32_t temp_last_time = 0;
+    if ((uint32_t)(now - temp_last_time) >= 100)
     {
-        temp_changed = 1;
-    }
-    else
-    {
-        temp_changed = 0;
-    }
-    prev_temp = temp;
-    
-
-    int32_t angle = read_angle();
-    uint8_t posture_flag = 0;
-    if (angle <= 100 && angle >= -100)
-    {
-        if (Posture != SUPINE)
+        temp_last_time = now;
+        int32_t t;
+        bool is_temp_smoothed = read_temp(&t);
+        if (is_temp_smoothed)
         {
-            posture_flag = 1;
+            temp = t;
+            temp_changed = 1;
         }
-        else
-        {
-            posture_flag = 0;
-        }
-        Posture = SUPINE;
+        angle_changed = read_angle(now);
     }
-    else if (angle <= 400 && angle >= 200)
-    {
-        if (Posture != RIGHT_30)
-        {
-            posture_flag = 1;
-        }
-        else
-        {
-            posture_flag = 0;
-        }
-        Posture = RIGHT_30;
-    }
-    else if (angle <= -200 && angle >= -400)
-    {
-        if (Posture != LEFT_30)
-        {
-            posture_flag = 1;
-        }
-        else
-        {
-            posture_flag = 0;
-        }
-        Posture = LEFT_30;
-    }
-    else if (angle > 400 || angle < -400)
-    {
-        Alerts.hob_high = 1;
-        Mode = ALERT;
-    }
-    
-    if (angle != prev_angle)
-    {
-        angle_changed = 1;
-        prev_angle_time = now;
-    }
-    else
-    {
-        angle_changed = 0;
-    }
+   
     prev_angle = angle;
-    switch (Mode)
-    {
-        case MONITOR: {
-            //oled live view
-            //device logs events
-            //reposoitning clock runs
-            static int32_t baseline = 0;
-            if (clock_flag == 0)
-            {
-                start_clock = now;
-                clock_flag = 1;
-            }
-            if (stand_to_mon == 1)
-            {
-                
-                static uint8_t get_ten_temps = 0;
-                
-                if (get_ten_temps < 10)
-                {
-                    baseline += temp;
-                    get_ten_temps ++;
-                }
-                else
-                {
-                    baseline /= 10;
-                    get_ten_temps = 0;
-                    stand_to_mon = 0;
-                }
-            }
-            else
-            {
-                if (abs(temp - baseline) > 2)
-                {
-                    Alerts.temp_arise = 1;
-                    Mode = ALERT; //USE QUALIFY . C HERE????
-                }
-            }
-            if ((uint32_t)(now - start_clock) >= MONITOR_CLOCK)
-            {
-                Alerts.turn_due = 1;
-                Mode = ALERT;
-                printf("TURN PATIENT");
-            }
-            
-            if (posture_flag == 1 && 
-                        (now - prev_angle_time) >= CLOCK_RESET)
-            {
-                clock_flag = 0;
-            }
-            break;
-        }
-        case ALERT:
+    ref_angle = angle;
+
+    if (monitor_flag == 1) 
+    { 
+        if (temp_changed)
         {
-            
-            break;
+            monitor_temp(now);
+        }
+        if (angle_changed)
+        {
+            monitor_angle(now);
+            supervise_turn(now);
         }
     }
     
 
 
+    if (b1_presses)
+    {
+        bool b1 = b1_presses;
+        b1_presses = 0;
+        alerts_service(now, b1);
+    }
     
     /* Status line — on change cadence, cheap (R18 discipline). */
     //OONLY OLED SHOULD PRINT EVERYTHING HERE, live updates
     if ((uint32_t)(now - status_last) >= STATUS_PERIOD_MS) {
         status_last = now;
-        oled_printf(4, "touch %5ld", (long)touch_raw);
-        oled_printf(5, "B1 x%lu  B2 x%lu",
-                    (unsigned long)b1_presses, (unsigned long)b2_presses);
-        if (temp_changed)
+        if (b2_presses)
         {
-            printf("temperature: %d.%d   \n", temp / 10, temp % 10);
+            b2_presses = 0;
+            ui_pages_next();
         }
-        if (angle_changed)
+
+        if (temp_changed || angle_changed)
         {
-            if (angle < 0)
-            {
-                angle *= -1;
-                printf("current angle: -%d.%d   \n", angle / 10, angle % 10);
-            } 
-            else {
-                printf("current angle: %d.%d   \n", angle / 10, angle % 10);
-            }
+            ui_pages_mark_dirty();
         }
+        ui_pages_service();
     }
 
     /* Console echo — the one non-blocking console call (R20). */
-    static char buffer[16];
-    char *argv[8];
+    static char buffer[50];
     static uint8_t buffer_length = 0;
     int ch = console_poll();
-    {
         
-        if (ch >= 0x20 && ch <= 0x7E) {
-            buffer[buffer_length++] = (char) ch;
-            putchar(ch);
-            fflush(stdout);
-        } 
-        else if (ch == '\r') {
-            buffer[buffer_length] = '\0';
-            buffer_length = 0;
-            printf("\n");
-            int argc = console_tokenize(buffer, argv, 8);
-            if (argc == 0) {
-                continue;
-            }
-            process_user_input(argv);
-        }
+    if (ch >= 0x20 && ch <= 0x7E) {
+        buffer[buffer_length++] = (char) ch;
+        putchar(ch);
+        fflush(stdout);
+    } 
+    else if (ch == '\r') {
+        buffer[buffer_length] = '\0';
+        buffer_length = 0;
+        printf("\n");
+        process_user_input(buffer);
     }
 }
 
-uint32_t read_temp(void)
+static bool read_temp(int32_t *new_temp)
 {
     uint8_t temp_status = 0;
     float temp = 0;
-    STTS22H_TEMP_Get_DRDY_Status(&temp_sensor, &temp_status);
-    if (temp_status)
+    if (STTS22H_TEMP_Get_DRDY_Status(&temp_sensor, &temp_status) != STTS22H_OK)
     {
-        STTS22H_TEMP_GetTemperature(&temp_sensor, &temp);
-        uint32_t temperature = (uint32_t) temp * 10;
-        return temperature;
-        
+        return false;
     }
-    return -1;
+
+    STTS22H_TEMP_GetTemperature(&temp_sensor, &temp);
+    *new_temp = (int32_t) lroundf((temp * 10));
+    return true; 
 }
 
-uint32_t angle = 0;
-int32_t read_angle()
+static void monitor_temp(uint32_t now)
 {
-    float pitch = 0;
+    static uint8_t smooth = 0;
+    if (!baseline_ready)
+    {
+        baseline += temp;
+        smooth++;
+        if (((uint32_t) now - start_clock) >= 1000 && smooth > 0)
+        {
+            baseline /= (uint32_t) smooth;
+            baseline_ready = 1;
+            qualify_init(&temp_qualify, baseline + cfg_delta_t_tenths, 3000, 5, now);
+            printf("TEMP BASELINE %d.%d", baseline / 1000, baseline % 1000);
+            event_count++;
+        }
+        return;
+    }
+    switch (qualify_feed(&temp_qualify, temp - baseline, now)) {
+        case QUALIFY_SET:
+        {
+            alert_list[1].active = true;  
+            alert_list[1].time_found = now;
+            printf("TEMP-RISE SET %d.%d", temp / 10, temp % 10); 
+            event_count++; 
+            break;
+        }
+        case QUALIFY_CLEAR:
+        {
+            alert_clear(1); 
+            printf("TEMP-RISE CLEAR");
+            break;
+        } 
+        default: break;
+    }
+}
+
+static void monitor_angle(uint32_t now)
+{
+    static bool turn_state = 0;
+    static uint32_t turn_clock = 0;
+    switch (qualify_feed(&hob, angle, now)) {
+    case QUALIFY_SET: { 
+        alert_list[2].active = true;
+        printf("HOB-HIGH"); 
+        break; 
+    }
+    case QUALIFY_CLEAR: 
+    {
+        alert_clear(1);
+        printf("HOB-HIGH CLEAR");
+        break;
+    }
+    default: break;
+    }
+
+    if (labs(angle - ref_angle) >= cfg_delta_turn_tenths) 
+    {
+        if (!turn_state) 
+        { 
+            turn_state = true; 
+            turn_clock = now; 
+        }
+        else if ((uint32_t)(now - turn_clock) >= (uint32_t)cfg_t_hold_s * 1000u) {
+            turn_state = false; 
+            ref_angle = angle;
+            printf("POSTURE CHANGE");
+            event_count++;
+            clock_reset(now);
+        }
+    } else {
+        turn_state = false;                       
+    }
+    Posture pos = posture_check(roll_calib);
+    static bool pos_change = false;
+    static Posture prev_posture;
+    static uint32_t posture_time = 0;
+    if (pos == UNCLEAR || pos == posture) 
+    { 
+        pos_change = false; 
+    }
+    else if (!pos_change || pos != prev_posture)    
+    { 
+        prev_posture = pos; 
+        posture_time = now; 
+        pos_change = true; 
+    }
+    else if ((uint32_t)(now - posture_time) >= (uint32_t)cfg_t_hold_s * 1000u) {
+        printf("POSTURE CHANGE %s->%s", pos_names[posture], pos_names[pos]);
+        posture = pos; 
+        pos_change = false; 
+        event_count++;
+        clock_reset(now);
+    }
+}
+
+static uint32_t clock_start = 0;
+static void clock_reset(uint32_t now)
+{
+    clock_start = now;
+    printf("CLOCk RESET");
+    alert_list[0].active = false;
+    printf("TURN-DUE CLEARED");
+}
+
+static void supervise_turn(uint32_t now)
+{
+    if ((alert_list[0].active) &&
+        ((uint32_t)(now - clock_start) >= (uint32_t)cfg_turn_interval_s * 1000u)) {
+        //alert!
+        printf("TURN-DUE interval %ld s exceeded", (long)cfg_turn_interval_s);
+    }
+}
+
+static Posture posture_check(int32_t roll)
+{
+    if (labs(roll) <= 100)
+    {
+        return SUPINE;
+    }
+    if (roll >= 200 && roll <= 400)
+    {
+        return RIGHT_30;
+    }
+    if (roll <= -200 && roll >= -400)
+    {
+        return LEFT_30;
+    }
+    return UNCLEAR;
+}
+
+static bool read_angle(uint32_t now)
+{
+
     ISM330DHCX_Axes_t current_acc;
     static ISM330DHCX_Axes_t four_acc[4];
     static ISM330DHCX_Axes_t smooth_acc;
@@ -450,184 +537,203 @@ int32_t read_angle()
     static uint8_t smooth_count = 0;
     if (imu_int1_event == 1)
     {
+        imu_int1_event = 0;
         uint32_t check = ISM330DHCX_ACC_GetAxes(&imu, &current_acc);
         if (check == 0)
         {
-            four_acc[smooth_count] = current_acc;
-            smooth_count++;
-            imu_int1_event = 0;
+            if (smooth_count < 4)
+            {
+                four_acc[smooth_count] = current_acc;
+                smooth_count++;
+                return false;
+            }
+            else 
+            {
+                for (int i = 0; i < 4; i++)
+                {
+                    smooth_acc.x += four_acc[i].x;
+                    smooth_acc.y += four_acc[i].y;
+                    smooth_acc.z += four_acc[i].z;
+                }
+                smooth_acc.x /= 4;
+                smooth_acc.y /= 4;
+                smooth_acc.z /= 4;
+                float within_sqr = (float)(smooth_acc.y * smooth_acc.y) + (float)(smooth_acc.z * smooth_acc.z);
+                pitch = atan2f((float)smooth_acc.x, sqrtf(within_sqr)) * (180.0 / M_PI);
+                roll = atan2f((float)smooth_acc.y, smooth_acc.z) * (180.0 / M_PI);
+                angle = lroundf(pitch * 10) - angle_offset;
+                roll_calib = lroundf(roll * 10) - roll_offset;
+                smooth_count = 0;
+                return true;
+            }
         }
     }
-    if (smooth_count == 4)
+    else 
     {
-        for (int i = 0; i < 4; i++)
-        {
-            smooth_acc.x += four_acc[i].x;
-            smooth_acc.y += four_acc[i].y;
-            smooth_acc.z += four_acc[i].z;
-        }
-        smooth_acc.x /= 4;
-        smooth_acc.y /= 4;
-        smooth_acc.z /= 4;
-        float within_sqr = (float)(smooth_acc.y * smooth_acc.y) + (float)(smooth_acc.z * smooth_acc.z);
-        pitch = atan2f((float)smooth_acc.x, sqrtf(within_sqr)) * (180.0 / M_PI);
-        angle = lroundf(pitch * 10) - angle_offset;
-
-        smooth_count = 0;
-        return angle;
+        return false;
     }
+    
 }
 
-void process_user_input(char* command[])
+void process_user_input(char* command)
 {
-    uint32_t v;
-    if (strcmp(command[0], "status") == 0) 
+    const config_entry_t *set_entry;
+    config_cmd_result_t result = config_table_command(command, &set_entry);
+    if (result == CFG_CMD_SET_OK)
     {
-        //PRINT LOG
-    } 
-    else if (strcmp(command[0], "cal") == 0) 
+        char buffer[16];
+        config_table_format(set_entry, buffer, 16);
+        set_config();
+        printf("CONFIG ");
+        event_count++;
+    }
+
+
+    char *argv[8];
+    int argc = console_tokenize(command, argv, 8);
+    if (argc == 0)
+    {
+        return;
+    }
+
+    if (strcmp(argv[0], "status") == 0)
+    {
+        //print_status()  //IMPLEMENT THIS
+    }
+    else if(strcmp(argv[0], "cal") == 0)
     {
         angle_offset = angle;
+        roll_offset = roll_calib;
+        printf("CAL complete");
+        event_count++;
     }
-    else if (strcmp(command[0], "cal") == 0) {
-        if (argc < 2 || !parse_u32(command[1], &v)) {
-            printf("rejected: usage 'cal <microseconds>' (digits only)\n");
-        } else if (validate_e(v, &settings)) {
-            settings.E = v;
-            show_settings();
-        }
+    else
+    {
+        printf("wrong command");
+    }
+
 }
 
-//Need to figure out graduate requriement still!!!
-//example Plain Text, this is all Putyty needs to send
-/*
-[ 0.000] POST START
-[ 0.035] STTS22H FOUND ID=0xA0
-[ 0.040] ISM330DHCX FOUND ID=0x6B
-[ 0.050] POST PASS
- 
-[ 15.322] PATIENT PRESENT
-[ 15.322] MODE MONITOR
- 
-[ 25.521] TEMP BASELINE 24.3C
- 
-[ 140.000] TURN-DUE INTERVAL EXCEEDED
- 
-[ 150.100] ACK TURN-DUE OVERDUE 10S
- 
-[ 210.100] TURN-DUE REARM
- 
-[ 250.201] POSTURE CHANGE SUPINE->LEFT_30
-[ 250.202] CLOCK RESET
- 
-[ 320.500] HOB-HIGH SET 32.1
- 
-[ 345.800] HOB-HIGH CLEAR
- 
-[ 380.100] TEMP-RISE SET
- 
-[ 400.000] PATIENT ABSENT
-[ 400.000] MODE STANDBY
-[ 400.000] ALERTS CLEARED*/
+int console_tokenize(char *line, char *argv[], int max_tokens)
+{
+    int argc = 0;
 
+    while (argc < max_tokens) {
+        while (*line == ' ' || *line == '\t') {  /* skip separators */
+            *line++ = '\0';
+        }
+        if (*line == '\0') {
+            break;
+        }
+        argv[argc++] = line;
+        while (*line != '\0' && *line != ' ' && *line != '\t') {
+            line++;
+        }
+    }
+    return argc;
+}
 
+static void set_config(void)
+{
+    qualify_config(&hob, cfg_hob_limit_tenths, 
+        1000 * (uint32_t) cfg_t_grace_s, 20);
 
-/*LIVE Page
+    if (baseline_ready)
+    {
+        qualify_config(&temp_qualify, baseline + cfg_delta_t_tenths, 3000, 5);
+    }
+}
 
-Default page.
+static void render_live(void)
+{
+    char buf[16]; 
+    
+    if (bed_used)
+    {
+        snprintf(buf, sizeof(buf), "yes");
+        ui_row_put(2, "Present", buf);
+    }
+    else
+    {
+        snprintf(buf, sizeof(buf), "no");
+        ui_row_put(2, "Present", buf);
+    }
+    snprintf(buf, sizeof(buf), "%d.%d", angle / 10, angle % 10);
+    if (angle < 0)
+    {
+        angle *= -1;
+        ui_row_put(3, "Angle", buf);
+    } 
+    else {
+        ui_row_put(3, "Angle", buf);
+    }
+    snprintf(buf, sizeof(buf), "%d.%d", temp / 10, angle % 10);
+    ui_row_put(4, "Temp", buf);
+}
 
-Shows current measurements.
+static void render_clocks(void)
+{
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%lu", (unsigned long) HAL_GetTick() / 1000);
+    ui_row_put(2, "Time", buf);
 
-Example:
+}
 
-Plain Text
-LIVE
- 
-Present: YES
- 
-Angle: 14.8
-Temp: 26.1
-Base: 24.0
- 
-NORMAL
- 
-Show more lines
+static void render_session(void)
+{
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%lu", (unsigned long)event_count);
+    ui_row_put(2, "Events", buf);
 
-or
+    snprintf(buf, sizeof(buf), "%lu", (unsigned long)alert_count);
+    ui_row_put(3, "Events", buf);
+}
 
-Plain Text
-LIVE
- 
-Present: YES
- 
-Angle: 32.1
-Temp: 25.2
-Base: 24.0
- 
-HOB-HIGH
- 
-Show more lines
+static void alert_found(int i, uint32_t now)
+{
+    alert_list[i].active = true;
+    alert_list[i].ack = false;
+    alert_list[i].time_found = now;
+    alert_list[i].ack = false;
+    alert_count++;
+    ui_pages_mark_dirty();
+}
 
-Requirements say LIVE should show:
+static void alert_clear(int i)
+{
+    alert_list[i].active = false;
+    alert_list[i].ack = false;
+    ui_pages_mark_dirty();
+}
 
-Plain Text
-presence
-angle
-temperature
-baseline temperature*/
+static void alerts_service(uint32_t now, bool b1)
+{
+    if (monitor_flag != 1) return;
+    if (b1) {
+       int8_t index_high = -1;
+        for (int i = 0; i < 3; i++)
+        {
+            if (alert_list[i].active)
+            {
+                index_high = i;
+                break;
+            }
+        }
+        if (index_high >= 0) {
+            alert_list[index_high].ack = true;
+            alert_list[index_high].ack = now;
+            printf("ACK %s overdue %lu s", alert_list[index_high].name,
+                      (unsigned long)((now - alert_list[index_high].time_found) / 1000));
+            ui_pages_mark_dirty();
+        }
+    }
 
-/*CLOCKS Page
-
-Shows timing.
-
-Example:
-
-Plain Text
-CLOCKS
- 
-Turn: 01:43
-Limit: 02:00
- 
-Mode: MONITOR
- 
-State: 01:43
-Show more lines
-
-The nurse can directly see:
-
-Plain Text
-how long since last reposition
-Show more lines
-
-After TURN-DUE:
-
-Plain Text
-CLOCKS
- 
-OVERDUE
- 
-02:36
-Show more lines
-SESSION Page
-
-Statistics.
-
-Example:
-
-Plain Text
-SESSION
- 
-Events: 24
- 
-Alerts: 3
- 
-Posture:
-SUPINE
-Show more lines
-
-For GR-A you might also show:
-
-Plain Text
-SUP 50%
-LEFT 30%
-RIGHT 20%*/ //BUTTOn 2 cycles these pages
+    for (int i = 0; i < 3; i++) {
+        if (alert_list[i].active && alert_list[i].ack &&
+            (uint32_t)(now - alert_list[i].t_ack) >= (uint32_t)cfg_rearm_s * 1000u) {
+            alert_list[i].ack = false;
+            printf("%s REARM", alert_list[i].name);
+            ui_pages_mark_dirty();
+        }
+    }
+}
