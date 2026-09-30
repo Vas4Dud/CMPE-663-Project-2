@@ -67,6 +67,7 @@ static void supervise_turn(uint32_t now);
 static void clock_reset(uint32_t now);
 static void monitor_angle(uint32_t now);
 static void monitor_temp(uint32_t now);
+void print_status(void);
 
 extern I2C_HandleTypeDef hi2c3;          /* CubeMX-generated handles      */
 extern TSC_HandleTypeDef htsc;
@@ -95,6 +96,8 @@ static int32_t roll_calib = 0;
 static qualify_t hob;
 static qualify_t temp_qualify;
 static int32_t  ref_angle;
+static uint32_t clock_start = 0; //posture clock
+static uint32_t turn_clock = 0; //turning clock
 const char *const pos_names[] = { "SUPINE", "LEFT_30", "RIGHT_30", "UNCLEAR" };
 void HAL_GPIO_EXTI_Callback(uint16_t pin)
 {
@@ -170,7 +173,7 @@ static int32_t prev_angle = 0;
 static uint32_t prev_angle_time = 0;
 static uint8_t temp_changed = 0;
 static uint8_t angle_changed = 0;
-static uint32_t start_clock = 0;
+static uint32_t start_clock = 0; //time within minotr
 static uint8_t clock_flag = 0;
 static uint8_t bed_used = 0;
 static uint32_t event_count = 0;
@@ -188,7 +191,7 @@ typedef struct {
     uint32_t t_ack;
 } Alerts;
 
-static Alerts alert_list[3] = {{"TURN-DUE"}, {"TEMP-RISE"}, {"HOB-HIGH"}};
+static Alerts alert_list[3] = {{"TURN-DUE"}, {"HOB-HIGH"}, {"TEMP-RISE"}};
 
 void app_init(void)
 {
@@ -237,7 +240,7 @@ void app_service(void)
     static uint8_t touch_detected = 0;
     uint32_t now = HAL_GetTick();
     static uint8_t time_status = 0;
-    static uint8_t previous_state = 0;
+    static uint8_t state_changed = 0;
     
 
 
@@ -278,21 +281,26 @@ void app_service(void)
                 {
                     bed_used = 0;
                     monitor_flag = 0;
-                    
+                    alert_clear(0);
+                    alert_clear(1);
+                    alert_clear(2);
                     first_state = 0;
                     printf("[%4lu.%03lu] PATIENT ABSENT\n", now / 1000, now % 1000);
                     event_count++;
+                    
                 }
             }
             else 
             {
                 if (time_diff > cfg_present_ms)
                 {
+                    clock_start = now;
                     bed_used = 1;
                     monitor_flag = 1;
+                    baseline = 0;
                     baseline_ready = 0;
                     qualify_init(&hob, 
-                        cfg_hob_limit_tenths, (uint32_t) cfg_t_grace_s * 1000, 20, now);
+                            cfg_hob_limit_tenths, (uint32_t) cfg_t_grace_s * 1000, 20, now);
                     stand_to_mon = 1;
                     first_state = 0;
                     printf("[%4lu.%03lu] PATIENT PRESENT\n", now / 1000, now % 1000);
@@ -304,6 +312,7 @@ void app_service(void)
     }
     else {
         first_state = 0;
+        stand_to_mon = 0;
     }
     
     static uint32_t temp_last_time = 0;
@@ -321,10 +330,15 @@ void app_service(void)
     }
    
     prev_angle = angle;
-    ref_angle = angle;
 
     if (monitor_flag == 1) 
     { 
+        if (stand_to_mon == 1)
+        {
+            start_clock = now;
+            stand_to_mon = 0;
+            ref_angle = angle;
+        }
         if (temp_changed)
         {
             monitor_temp(now);
@@ -332,8 +346,8 @@ void app_service(void)
         if (angle_changed)
         {
             monitor_angle(now);
-            supervise_turn(now);
         }
+        supervise_turn(now);
     }
     
 
@@ -401,28 +415,28 @@ static void monitor_temp(uint32_t now)
     {
         baseline += temp;
         smooth++;
-        if (((uint32_t) now - start_clock) >= 1000 && smooth > 0)
+        if (((uint32_t) now - start_clock) >= 10000 && smooth > 0)
         {
             baseline /= (uint32_t) smooth;
             baseline_ready = 1;
-            qualify_init(&temp_qualify, baseline + cfg_delta_t_tenths, 3000, 5, now);
-            printf("TEMP BASELINE %d.%d", baseline / 1000, baseline % 1000);
+            qualify_init(&temp_qualify, cfg_delta_t_tenths, 3000, 5, now);
+            printf("TEMP BASELINE %d.%d", baseline / 10, baseline % 10);
             event_count++;
+            smooth = 0;
         }
         return;
     }
     switch (qualify_feed(&temp_qualify, temp - baseline, now)) {
         case QUALIFY_SET:
         {
-            alert_list[1].active = true;  
-            alert_list[1].time_found = now;
+            alert_found(2, now);
             printf("TEMP-RISE SET %d.%d", temp / 10, temp % 10); 
             event_count++; 
             break;
         }
         case QUALIFY_CLEAR:
         {
-            alert_clear(1); 
+            alert_clear(2); 
             printf("TEMP-RISE CLEAR");
             break;
         } 
@@ -433,10 +447,10 @@ static void monitor_temp(uint32_t now)
 static void monitor_angle(uint32_t now)
 {
     static bool turn_state = 0;
-    static uint32_t turn_clock = 0;
+    
     switch (qualify_feed(&hob, angle, now)) {
     case QUALIFY_SET: { 
-        alert_list[2].active = true;
+        alert_found(1, now);
         printf("HOB-HIGH"); 
         break; 
     }
@@ -489,7 +503,7 @@ static void monitor_angle(uint32_t now)
     }
 }
 
-static uint32_t clock_start = 0;
+
 static void clock_reset(uint32_t now)
 {
     clock_start = now;
@@ -500,9 +514,9 @@ static void clock_reset(uint32_t now)
 
 static void supervise_turn(uint32_t now)
 {
-    if ((alert_list[0].active) &&
+    if ((!alert_list[0].active) &&
         ((uint32_t)(now - clock_start) >= (uint32_t)cfg_turn_interval_s * 1000u)) {
-        //alert!
+        alert_found(0, now);
         printf("TURN-DUE interval %ld s exceeded", (long)cfg_turn_interval_s);
     }
 }
@@ -598,7 +612,7 @@ void process_user_input(char* command)
 
     if (strcmp(argv[0], "status") == 0)
     {
-        //print_status()  //IMPLEMENT THIS
+        print_status();  //IMPLEMENT THIS
     }
     else if(strcmp(argv[0], "cal") == 0)
     {
@@ -612,6 +626,30 @@ void process_user_input(char* command)
         printf("wrong command");
     }
 
+}
+
+void print_status(void)
+{
+    if (bed_used)
+    {
+        printf("PATIENT PRESENT");
+    }
+    else
+    {
+        printf("PATIENT ABSENT");
+    }
+    
+    printf("angle(pitch): %d.%d\n", angle / 10, angle % 10);
+    printf("angle(roll): %d.%d\n", roll_calib / 10, roll_calib % 10);
+
+    //temperature 
+    printf("Temperature: %d.%d\n", temp / 1000, temp % 1000);
+    //posture 
+    printf("Posture %s\n", pos_names[posture]);
+    //clocks active 
+    //alerts 
+    printf("total alerts %d\n", alert_count);
+    //config values
 }
 
 int console_tokenize(char *line, char *argv[], int max_tokens)
@@ -640,7 +678,7 @@ static void set_config(void)
 
     if (baseline_ready)
     {
-        qualify_config(&temp_qualify, baseline + cfg_delta_t_tenths, 3000, 5);
+        qualify_config(&temp_qualify, cfg_delta_t_tenths, 3000, 5);
     }
 }
 
@@ -661,14 +699,15 @@ static void render_live(void)
     snprintf(buf, sizeof(buf), "%d.%d", angle / 10, angle % 10);
     if (angle < 0)
     {
-        angle *= -1;
         ui_row_put(3, "Angle", buf);
     } 
     else {
         ui_row_put(3, "Angle", buf);
     }
-    snprintf(buf, sizeof(buf), "%d.%d", temp / 10, angle % 10);
+    snprintf(buf, sizeof(buf), "%d.%d", temp / 10, temp % 10);
     ui_row_put(4, "Temp", buf);
+    snprintf(buf, sizeof(buf), "%d.%d", baseline / 10, baseline % 10);
+    ui_row_put(5, "baseline", buf);
 }
 
 static void render_clocks(void)
@@ -686,7 +725,7 @@ static void render_session(void)
     ui_row_put(2, "Events", buf);
 
     snprintf(buf, sizeof(buf), "%lu", (unsigned long)alert_count);
-    ui_row_put(3, "Events", buf);
+    ui_row_put(3, "Alerts", buf);
 }
 
 static void alert_found(int i, uint32_t now)
@@ -721,7 +760,7 @@ static void alerts_service(uint32_t now, bool b1)
         }
         if (index_high >= 0) {
             alert_list[index_high].ack = true;
-            alert_list[index_high].ack = now;
+            alert_list[index_high].t_ack = now;
             printf("ACK %s overdue %lu s", alert_list[index_high].name,
                       (unsigned long)((now - alert_list[index_high].time_found) / 1000));
             ui_pages_mark_dirty();
