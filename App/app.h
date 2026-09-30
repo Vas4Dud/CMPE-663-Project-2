@@ -45,14 +45,6 @@ static void supervise_turn(uint32_t now);
 static void clock_reset(uint32_t now);
 static void monitor_angle(uint32_t now);
 static void monitor_temp(uint32_t now);
-
-
-enum ModesOfOperation{
-    POST,
-    STANDBY,
-    MONITOR,
-    ALERT,
-    CONFIG
-};
+void print_status(void);
 
 #endif /* APP_H */
